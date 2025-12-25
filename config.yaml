@@ -1,0 +1,11 @@
+layers: 12
+hidden_dim: 768
+attn_heads: 12
+kv_compress_dim: 128
+q_compress_dim: 256
+shared_experts: 1
+routed_experts: 16
+top_k_routing: 2
+expert_hidden_dim: 512
+dense_layers: 2
+mtp_depth: 1
