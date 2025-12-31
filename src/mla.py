@@ -1,26 +1,24 @@
 import torch
-import yaml
+from typing import Optional, Tuple
 from pathlib import Path
 import sys
-from typing import Optional, Tuple
-
-from utils.deepseek_rope import apply_rotary_pos_emb, rotate_half, RoPE
-from utils.rms_norm import RMSNorm
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from deepseek_rope import rotate_half, RoPE
+from utils.rms_norm import RMSNorm
+
 class MultiHeadLatentAttention(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, config):
         super().__init__()
-        self.config = yaml.load("config.yaml", Loader=yaml.FullLoader)
+        self.config = config
         
-        self.hidden_dim = self.config["hidden_dim"]
-        self.num_heads = self.config["num_heads"]
-        self.kv_compress_dim = self.config["kv_compress_dim"]
-        self.q_compress_dim = self.config["q_compress_dim"]
-        self.qk_nope_head_dim = self.config["qk_nope_head_dim"]
-        self.qk_rope_head_dim = self.config["qk_rope_head_dim"]
-        self.v_head_dim = self.config["v_head_dim"]
+        self.hidden_dim = self.config.hidden_dim
+        self.num_heads = self.config.num_attention_heads
+        self.kv_compress_dim = self.config.kv_compress_dim
+        self.q_compress_dim = self.config.q_compress_dim
+        self.qk_nope_head_dim = self.config.qk_nope_head_dim
+        self.qk_rope_head_dim = self.config.qk_rope_head_dim
+        self.v_head_dim = self.config.v_head_dim
         
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         
@@ -82,11 +80,9 @@ class MultiHeadLatentAttention(torch.nn.Module):
 
         self.rope = RoPE(
             dim=self.qk_rope_head_dim,
-            max_seq_len=self.config["max_seq_len"],
-            base=self.config["rope_base"],
+            max_seq_len=self.config.max_seq_len,
+            base=self.config.rope_base,
         )
-
-
 
     def forward(
         self,
@@ -94,7 +90,7 @@ class MultiHeadLatentAttention(torch.nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache: bool = False,
+        use_cache: bool = True,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         
         batch_size, seq_len, _ = x.shape
@@ -159,15 +155,11 @@ class MultiHeadLatentAttention(torch.nn.Module):
         # Transpose to (batch, num_heads, seq_len, qk_rope_head_dim)
         q_rope = q_rope.transpose(1,2)
 
-        # 4. Apply RoPE to q_rope
-        cos, sin = self.rope(seq_len, device=x.device, dtype=x.dtype)
-        q_cos = cos[:, -seq_len:, :]
-        q_sin = sin[:, -seq_len:, :]
-        
+        # 4.1. Apply RoPE to q_rope
         # Unsqueeze to add dim for batch and heads: (1, 1, seq_len, qk_rope_head_dim)
-        q_cos = q_cos.unsqueeze(1)
-        q_sin = q_sin.unsqueeze(1)
-
+        q_cos = cos[-seq_len:].unsqueeze(0).unsqueeze(0)
+        q_sin = sin[-seq_len:].unsqueeze(0).unsqueeze(0)
+        
         # Apply rotation: rotate = x * cos + rotate_half(x) * sin
         q_rope = (q_rope * q_cos) + (rotate_half(q_rope) * q_sin)
 
@@ -218,3 +210,44 @@ class MultiHeadLatentAttention(torch.nn.Module):
         output = self.o_proj(output)
 
         return output, present_key_value
+
+# ============== Test Code ==============
+if __name__ == "__main__":
+    from dataclasses import dataclass
+    
+    @dataclass
+    class TestConfig:
+        hidden_dim: int = 768
+        num_attention_heads: int = 12
+        kv_compress_dim: int = 128
+        q_compress_dim: int = 256
+        qk_nope_head_dim: int = 32
+        qk_rope_head_dim: int = 32
+        v_head_dim: int = 64
+        max_seq_len: int = 2048
+        rope_base: float = 10000.0
+    
+    config = TestConfig()
+    mla = MultiHeadLatentAttention(config)
+    
+    # Test forward pass
+    batch_size, seq_len = 2, 16
+    x = torch.randn(batch_size, seq_len, config.hidden_dim)
+    
+    # Without cache
+    output, cache = mla(x, use_cache=True)
+    print(f"Input shape:  {x.shape}")
+    print(f"Output shape: {output.shape}")
+    print(f"Cache c_kv shape:   {cache[0].shape}")
+    print(f"Cache k_rope shape: {cache[1].shape}")
+    
+    # With cache (simulate generation)
+    x_new = torch.randn(batch_size, 1, config.hidden_dim)
+    output_new, cache_new = mla(x_new, past_key_value=cache, use_cache=True)
+    print("\nGeneration step:")
+    print(f"New input shape:  {x_new.shape}")
+    print(f"New output shape: {output_new.shape}")
+    print(f"Updated cache c_kv shape:   {cache_new[0].shape}")
+    print(f"Updated cache k_rope shape: {cache_new[1].shape}")
+    
+    print("\nMLA test passed!")

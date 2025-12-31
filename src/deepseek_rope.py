@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple
+from typing import Tuple, cast
 
 class RoPE(torch.nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0):
@@ -9,53 +9,73 @@ class RoPE(torch.nn.Module):
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", self.inv_freq, persistent=True)
-        # Caches are derived data; don't save in state_dict.
+
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=True)
+        
+        # Inititalize cache placeholders
+        self.register_buffer("cos_cached", None, persistent=False)
+        self.register_buffer("sin_cached", None, persistent=False)
         self._cached_seq_len = 0
+
+        # Build initial cache
         self._build_cache()
 
     def _build_cache(self):
-        t = torch.arange(self.max_seq_len, device=self.inv_freq.device, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq)
+        """Pre-build cache for max_seq_len"""
+        t = torch.arange(0, self.max_seq_len).to(device=cast(torch.device, self.inv_freq.device), dtype=torch.float32)
+        freqs = torch.outer(t, cast(torch.Tensor, self.inv_freq).to(torch.float32))
         emb = torch.cat([freqs, freqs], dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
+        # Update buffers (can't use register_buffer after init, so direct assign)
+        self.cos_cached = emb.cos()
+        self.sin_cached = emb.sin()
+        self._cached_seq_len = self.max_seq_len
 
-    def forward(self, seq_len: int, *, device=None, dtype=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        seq_len: int,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns (cos, sin) for positions [0..seq_len-1].
         Shapes: (seq_len, dim). These broadcast against q/k shaped (..., seq_len, dim).
         """
-        if seq_len > self.max_seq_len:
+        seq_len_int: int = int(seq_len)
+
+        if seq_len_int > self.max_seq_len:
             raise ValueError(
-                f"Sequence length {seq_len} is longer than max_seq_len {self.max_seq_len}. "
+                f"Sequence length {seq_len_int} is longer than max_seq_len {self.max_seq_len}. "
                 "Increase max_seq_len when constructing RoPE."
             )
 
-        device = device if device is not None else self.inv_freq.device
+        device_: torch.device = (
+            cast(torch.device, self.inv_freq.device) if device is None else torch.device(device)
+        )
         # For numerical stability, compute angles in fp32 and cast at the end.
-        out_dtype = dtype if dtype is not None else torch.get_default_dtype()
+        out_dtype = dtype if dtype is not None else torch.get_default_dtype() 
 
         needs_refresh = (
             self.cos_cached is None
             or self.sin_cached is None
-            or self._cached_seq_len < seq_len
-            or self.cos_cached.device != device
+            or self._cached_seq_len < seq_len_int
+            or self.cos_cached.device != device_
         )
+
         if needs_refresh:
-            t = torch.arange(seq_len, device=device, dtype=torch.float32)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device=device, dtype=torch.float32))
+            t = torch.arange(0, seq_len_int).to(device=device_, dtype=torch.float32)
+            freqs = torch.outer(t, cast(torch.Tensor, self.inv_freq).to(device=device_, dtype=torch.float32))
             emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, dim)
             cos = emb.cos().to(dtype=out_dtype)
             sin = emb.sin().to(dtype=out_dtype)
-            self.cos_cached = cos
-            self.sin_cached = sin
+            self.cos_cached = emb.cos()
+            self.sin_cached = emb.sin()
             self._cached_seq_len = seq_len
         else:
-            cos = self.cos_cached[:seq_len].to(dtype=out_dtype)
-            sin = self.sin_cached[:seq_len].to(dtype=out_dtype)
+            cos = self.cos_cached[:seq_len_int].to(dtype=out_dtype)
+            sin = self.sin_cached[:seq_len_int].to(dtype=out_dtype)
 
         return cos, sin
 

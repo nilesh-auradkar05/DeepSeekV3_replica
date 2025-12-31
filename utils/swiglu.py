@@ -26,9 +26,9 @@ class SwiGLUFFN(torch.nn.Module):
         output: (batch, seq_len, hidden_dim)
         """
 
-        self.w_gate = torch.nn.Linear(hidden_dim, intermediate_dim)
-        self.w_up = torch.nn.Linear(hidden_dim, intermediate_dim)
-        self.w_down = torch.nn.Linear(intermediate_dim, hidden_dim)
+        self.w_gate = torch.nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.w_up = torch.nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.w_down = torch.nn.Linear(intermediate_dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Implement SwiGLU: (Swish(x @ W_gate) ⊙ (x @ W_up)) @ W_down
