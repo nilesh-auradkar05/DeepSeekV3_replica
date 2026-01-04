@@ -1,21 +1,59 @@
+"""
+DeepSeek-V3 Model for Causal Language Modeling
+==============================================
+
+The complete DeepSeek-V3 architecture:
+
+    Input tokens
+         ↓
+    [Token Embeddings]
+         ↓
+    [Transformer Stack: Dense + MoE layers]
+         ↓
+    [Final RMSNorm]
+         ↓
+    [LM Head] → Main logits (next-token prediction)
+         ↓
+    [MTP Module] → Additional logits (+2, +3, ... ahead)
+
+Key features:
+    - Multi-Head Latent Attention (MLA) for efficient KV caching
+    - Mixture of Experts (MoE) with auxiliary-loss-free load balancing  
+    - Multi-Token Prediction (MTP) for improved representations
+    - Gradient checkpointing support for memory efficiency
+"""
+
 import torch
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, cast, Set
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from MoE import DeepSeekMoE
-from deepseek_transformer import DeepSeekV3TransformerBlock, TransformerBlockStack
+from .MoE import DeepSeekMoE
+from .deepseek_transformer import DeepSeekV3TransformerBlock, TransformerBlockStack
 from utils.rms_norm import RMSNorm
-from mtp import MultiTokenPrediction, compute_mtp_loss
+from .mtp import MultiTokenPrediction, compute_mtp_loss
 
 class DeepSeekV3ForCausalLM(torch.nn.Module):
+    """
+    DeepSeek-V3 model for causal language modeling.
+    
+    Supports:
+        - Training with MTP loss
+        - Inference with KV caching
+        - Text generation with various sampling strategies
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
 
+        # Validate config
+        assert config.vocab_size > 0, f"vocab_size must be positive, got {config.vocab_size}"
+        assert config.hidden_dim > 0, f"hidden_dim must be positive, got {config.hidden_dim}"
+        assert config.num_layers > 0, f"num_layers must be positive, got {config.num_layers}"
+
         # 1. Token Embedding (input)
-        self.embed_tokens = torch.nn.Embedding(self.config.vocab_size, self.config.hidden_dim)
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_dim)
 
         # 2. Transformer layers
         self.layers = TransformerBlockStack(config)
@@ -24,11 +62,11 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
         self.norm = RMSNorm(self.config.hidden_dim)
 
         # 4. LM head (output) - seperate from embedding
-        self.lm_head = torch.nn.Linear(self.config.hidden_dim, self.config.vocab_size, bias=False)
+        self.lm_head = torch.nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
 
         # 5. Multi Token Prediction
         if self.config.mtp_depth > 0:
-            self.mtp = MultiTokenPrediction(config, self.embed_tokens)
+            self.mtp = MultiTokenPrediction(config, shared_embeddings=self.embed_tokens, shared_lm_head=self.lm_head)
         else:
             self.mtp = None
 
@@ -68,7 +106,7 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
         bool_mask = query_positions.unsqueeze(1) < key_positions.unsqueeze(0)
 
         # Convert to attention mask format
-        causal_mask = torch.zeros((seq_len, kv_seq_len), device=device, dtype=dtype)
+        causal_mask = torch.zeros(seq_len, kv_seq_len, device=device, dtype=dtype)
         causal_mask.masked_fill_(bool_mask, float("-inf"))
 
         return causal_mask.unsqueeze(0).unsqueeze(0)
@@ -82,17 +120,40 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
         use_cache: bool = True,
         return_dict: bool = True,
     ) -> Dict[str, torch.Tensor|Any]:
+        """
+        Forward pass through the model.
+        
+        Args:
+            input_ids: (batch, seq_len) token indices
+            attention_mask: Optional pre-computed attention mask
+            position_ids: Optional position indices (auto-generated if None)
+            past_key_values: KV cache from previous forward (for generation)
+            use_cache: Whether to return updated KV cache
+            return_dict: Always True (kept for compatibility)
+        
+        Returns:
+            Dictionary with:
+                - logits: (batch, seq_len, vocab_size) main predictions
+                - mtp_logits: List of MTP predictions (training only)
+                - past_key_values: Updated KV cache (if use_cache)
+                - routing_indices: List of routing tensors from MoE layers
+        """
         batch_size, seq_len = input_ids.shape
+
+        # Validate input tokens
+        assert input_ids.min() >= 0, f"Token IDs must be >= 0, got min {input_ids.min()}"
+        assert input_ids.max() < self.config.vocab_size, \
+            f"Token ID {input_ids.max()} >= vocab_size {self.config.vocab_size}"
 
         # 1. Embed token
         hidden_states = self.embed_tokens(input_ids)
 
         # 2. Create causal mask if not provided
         if attention_mask is None:
+            kv_seq_len = seq_len
             if past_key_values is not None:
-                kv_seq_len = past_key_values[0][0].shape[1] + seq_len
-            else:
-                kv_seq_len = seq_len
+                # add cached sequence length
+                kv_seq_len = past_key_values[0][0].size(1) + seq_len
             
             attention_mask = self._mask_causal_mask(
                 seq_len=seq_len,
@@ -117,15 +178,14 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
         logits = self.lm_head(hidden_states)
 
         # 6. Apply Multi Token Prediction
+        mtp_logits = []
         if self.mtp is not None and self.training:
             mtp_logits = self.mtp(hidden_states, input_ids)
-        else:
-            mtp_logits = []
 
         return {
             "logits": logits,
             "mtp_logits": mtp_logits,
-            "past_key_values": present_key_values if use_cache else None,
+            "past_key_values": present_key_values,
             "routing_indices": routing_indices
         }
 
@@ -134,69 +194,51 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        ignore_idx: int = -100,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute loss for training.
-
+        Compute training loss including MTP.
+        
         Args:
-            input_ids: (batch_size, seq_len) input tokens
-            labels: (batch_size, seq_len) target tokens (same as input_ids)
-            attention_mask: Optional attention mask.
-
+            input_ids: (batch, seq_len) input token IDs
+            labels: (batch, seq_len) target token IDs (shifted for next-token)
+                    If None, uses input_ids shifted by 1
+            attention_mask: Optional attention mask
+            ignore_index: Token ID to ignore in loss
+        
         Returns:
-            Dictionary with total_loss and individual loss components
+            Dictionary with loss values:
+                - total_loss: Combined loss for backprop
+                - loss_depth_0: Main LM loss
+                - loss_depth_1, ...: MTP losses
+                - routing_indices: For load balancing updates
         """
-        # Forward pass
-        outputs = self.forward(input_ids, attention_mask=attention_mask, **kwargs)
-
-        logits = outputs["logits"]
-        mtp_logits = outputs["mtp_logits"]
-
-        # Use input_ids as labels for next-token-prediction
+        # if labels not provided, create from input_ids
         if labels is None:
-            labels = input_ids
+            # Shift input ids to create labels
+            # input_ids[t] predicts input_ids[t+1]
+            labels = input_ids.clone()
 
-        # compute combined loss
+        # Forward pass    
+        outputs = self.forward(input_ids, attention_mask=attention_mask, use_cache=False)
+        main_logits = outputs["logits"]          # (B, S, V)
+        mtp_logits = outputs["mtp_logits"]       # list of (B, S, V)
+
+        # compute losses using the unified function
         total_loss, loss_dict = compute_mtp_loss(
-            main_logits=logits,
+            main_logits=main_logits[:,:-1],
             mtp_logits=mtp_logits,
-            input_ids=input_ids,
+            input_ids=labels[:,1:],
             mtp_lambda=self.config.mtp_lambda,
+            ignore_idx=ignore_idx,
         )
 
-        # Add routing indices for load balancing updates
-        loss_dict["routing_indices"] = outputs["routing_indices"]
+        # include routing indices for load balancing
+        if outputs["routing_indices"]:
+            loss_dict["routing_indices"] = outputs["routing_indices"]
 
         return loss_dict
-
-    def update_moe_load_balancing(
-        self,
-        routing_indices: torch.Tensor,
-        bias_update_speed: float = 0.0,
-    ):
-        """
-        Update MoE router biases based on routing indices.
-
-        Args:
-            routing_indices: List of routing tensors from forward pass
-            bias_update_speed: Override config's bias_update_speed if provided
-        """
-
-        if bias_update_speed == 0.0:
-            bias_update_speed = self.config.bias_update_speed
-
-        # Each MoE layer has its routing indices
-        moe_layer_idx = 0
-        for layer in self.layers.layers:
-            if getattr(layer, "is_moe_layer", False) and isinstance(layer.ffn, DeepSeekMoE):
-                if moe_layer_idx < len(routing_indices):
-                    # routing_indices[moe_layer_idx]: (batch, seq_len, num_experts_per_tok)
-                    layer.ffn.update_load_balancing(
-                        routing_indices[moe_layer_idx],
-                        bias_update_speed,
-                    )
-                    moe_layer_idx += 1
 
     @torch.no_grad()
     def generate(
@@ -207,8 +249,8 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         do_sample: bool = True,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
-
         """
         Generate text autoregressively.
 
@@ -225,9 +267,9 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
         """
         self.eval()
         batch_size = input_ids.shape[0]
+        device = input_ids.device
         generated = input_ids.clone()
         past_key_values = None
-        current_input: Optional[torch.Tensor] = None
 
         for _ in range(max_new_tokens):
             # Only process the last token if we have cache
@@ -239,36 +281,34 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
             # Forward pass
             outputs = self.forward(
                 current_input,
-                past_key_values=past_key_values if past_key_values is not None else None,
+                past_key_values=past_key_values,
                 use_cache=True,
             )
 
             logits = outputs["logits"][:, -1, :] # (batch_size, vocab_size)
-            past_key_values = outputs["past_key_values"]
+            past_key_values = cast(Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]], outputs["past_key_values"])
 
             # Apply temperature scaling
             if temperature != 1.0:
-                probs = logits / temperature
+                logits = logits / temperature
 
             # Apply top_k filtering
-            if top_k is not None:
-                indices_to_remove = logits < torch.topk(logits, top_k).values[:, -1:]
-                logits[indices_to_remove] = float("-inf")
+            if top_k is not None and top_k > 0:
+                top_k_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                threshold = top_k_vals[:, -1].unsqueeze(-1)
+                logits = logits.masked_fill(logits < threshold, float("-inf"))
 
             # Apply top_p filtering
-            if top_p is not None:
+            if top_p is not None and top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
 
                 # Remove tokens with cumulative probability > top_p
                 sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
                 sorted_indices_to_remove[:, 0] = False
 
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    dim=-1, index=sorted_indices, src=sorted_indices_to_remove
-                )
-                logits[indices_to_remove] = float("-inf")
+                mask = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits = logits.masked_fill(mask, float("-inf"))
 
             # Sample or greedy
             if do_sample:
@@ -278,6 +318,10 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
                 next_token = logits.argmax(dim=-1, keepdim=True)
 
             generated = torch.cat([generated, next_token], dim=-1)
+
+            if eos_token_id is not None:
+                if (next_token == eos_token_id).all():
+                    break
 
         return generated
 
@@ -302,47 +346,70 @@ class DeepSeekV3ForCausalLM(torch.nn.Module):
 
         For MoE layers, only count the experts that are activated
         """
+        seen: Set[int] = set()
+
+        def add_params_from(module: torch.nn.Module) -> int:
+            """Count parameters once per identity to avoid double-counting shared modules."""
+            n = 0
+            for p in module.parameters():
+                pid = id(p)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                n += p.numel()
+            return n
+
+        n_params = 0
+
         # Embedding + LM head
-        n_params = self.embed_tokens.weight.numel()
-        n_params += self.lm_head.weight.numel()
+        n_params += add_params_from(self.embed_tokens)
+        n_params += add_params_from(self.lm_head)
 
         # Final norm
-        n_params += sum(p.numel() for p in self.norm.parameters())
+        n_params += add_params_from(self.norm)
 
         # Transformer layers
         for layer in self.layers.layers:
             if not isinstance(layer, DeepSeekV3TransformerBlock):
                 continue
-            # Attention (always activated)
-            n_params += sum(p.numel() for p in layer.attn.parameters())
-            n_params += sum(p.numel() for p in layer.attn_norm.parameters())
-            n_params += sum(p.numel() for p in layer.ffn_norm.parameters())
 
-            if layer.is_moe_layer:
-                if not isinstance(layer.ffn, DeepSeekMoE):
-                    continue
-                # MoE: only count shared experts + top-k routed experts
+            # Attention (always activated)
+            n_params += add_params_from(layer.attn)
+            n_params += add_params_from(layer.attn_norm)
+            n_params += add_params_from(layer.ffn_norm)
+
+            if layer.is_moe_layer and isinstance(layer.ffn, DeepSeekMoE):
                 moe = layer.ffn
-                # Shared experts
+
+                # Router (gate) parameters are always active
+                if moe.gate is not None:
+                    n_params += add_params_from(moe.gate)
+
+                # Shared experts are always active
                 for expert in moe.shared_experts:
-                    n_params += sum(p.numel() for p in expert.parameters())
-                # Router
-                n_params += sum(p.numel() for p in moe.router.parameters())
-                # Only top-k routed experts activated per token
-                if len(moe.routed_experts) > 0:
-                    params_per_expert = sum(
-                        p.numel() for p in moe.routed_experts[0].parameters()
-                    )
+                    n_params += add_params_from(expert)
+
+                # Only top-k routed experts are activated per token
+                if len(moe.routed_experts) > 0 and moe.num_experts_per_tok > 0:
+                    params_per_expert = add_params_from(moe.routed_experts[0])
                     n_params += params_per_expert * moe.num_experts_per_tok
             else:
                 # Dense FFN (always activated)
-                n_params += sum(p.numel() for p in layer.ffn.parameters())
+                n_params += add_params_from(layer.ffn)
 
-        # MTP (if enabled)
+        # MTP (if enabled) — shared weights are already seen and will be skipped
         if self.mtp is not None:
-            n_params += sum(p.numel() for p in self.mtp.parameters())
+            n_params += add_params_from(self.mtp)
 
         return n_params
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable gradient checkpointing for memory efficiency"""
+        self.layers.enable_gradient_checkpointing()
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing."""
+        self.layers.disable_gradient_checkpointing()
 
 if __name__ == "__main__":
     import sys

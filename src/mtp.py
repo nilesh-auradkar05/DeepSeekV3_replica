@@ -1,24 +1,125 @@
+"""
+Multi-Token Prediction (MTP)
+============================
+
+DeepSeek-V3's approach to improving sample efficiency and representation quality.
+
+Key insight: Instead of predicting just the next token, predict multiple future
+tokens simultaneously. This provides:
+- Richer training signal (more supervision per forward pass)
+- Better long-range planning in representations
+- Improved sample efficiency
+
+Architecture per MTP depth:
+    hidden_states (from backbone) 
+           ↓
+    [norm → concat with shifted embeddings → linear → transformer layer → lm_head]
+           ↓
+    logits for position +d ahead
+
+The transformer layer at each depth is crucial.
+It allows each depth to build complex predictions from the backbone representations.
+
+Loss weighting:
+    total_loss = main_loss + lambda * sum(mtp_losses)
+    Default lambda = 0.3 (from paper)
+"""
+
 import torch
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.rms_norm import RMSNorm
+from utils.swiglu import SwiGLUFFN
+
+class MTPTransformerLayer(torch.nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        assert hidden_dim % num_heads == 0, \
+            f"hidden_dim {hidden_dim} must be divisible by num_heads {num_heads}"
+
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        # Self-attention
+        self.attn_norm = RMSNorm(hidden_dim)
+        self.q_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+        # FFN
+        self.ffn_norm = RMSNorm(hidden_dim)
+        self.ffn = SwiGLUFFN(hidden_dim, hidden_dim * 4)
+
+        self.dropout = torch.nn.Dropout(dropout) if dropout > 0.0 else torch.nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, seq_len, hidden_dim)
+        Returns:
+            output: (batch_size, seq_len, hidden_dim)
+        """
+        B, S, H = x.shape
+
+        # self-attention with residual connection
+        residual = x
+        x = self.attn_norm(x)
+
+        q = self.q_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Causal attention (MTP should only attend to previous tokens)
+        attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, H)
+        attn_out = self.out_proj(attn_out)
+
+        x = residual + self.dropout(attn_out)
+
+        # FFN with residual
+        residual = x
+        x = self.ffn_norm(x)
+        x = residual + self.dropout(self.ffn(x))
+
+        return x
 
 class MTPBlock(torch.nn.Module):
-    def __init__(self, config):
+    """
+    Single MTP prediction block for one depth level.
+    
+    Combines backbone hidden states with shifted token embeddings,
+    processes through a transformer layer, and predicts logits.
+    """
+    def __init__(self, config, shared_lm_head: Optional[torch.nn.Linear] = None):
         super().__init__()
+
+        self.dropout_val = config.dropout
+        
         self.hidden_dim = config.hidden_dim
+        self.vocab_size = config.vocab_size
 
         # Normalize incoming output from transformer block
-        self.norm = RMSNorm(self.hidden_dim)
+        self.input_norm = RMSNorm(self.hidden_dim)
 
         # Project input to hidden dimension
-        self.proj = torch.nn.Linear(self.hidden_dim * 2, self.hidden_dim, bias=False)
+        self.input_proj = torch.nn.Linear(self.hidden_dim * 2, self.hidden_dim, bias=False)
+
+        self.dropout = torch.nn.Dropout(config.dropout)
 
         # Transformer layer
-        self.lm_head = torch.nn.Linear(self.hidden_dim, config.vocab_size, bias=False)
+        num_mtp_heads = max(4, config.num_attention_heads // 2)
+        self.transformer = MTPTransformerLayer(hidden_dim=self.hidden_dim, num_heads=num_mtp_heads, dropout=config.dropout)
+
+        # output projection
+        if shared_lm_head is not None:
+            self.lm_head = shared_lm_head
+        else:
+            self.lm_head = torch.nn.Linear(self.hidden_dim, self.vocab_size, bias=False)
 
     def forward(
         self,
@@ -35,21 +136,47 @@ class MTPBlock(torch.nn.Module):
             logits: (batch_size, seq_len, vocab_size)
             hidden_states: (batch_size, seq_len, hidden_dim) for next depth of MTP
         """
-        hidden_states = self.norm(hidden_states)
+        assert hidden_states.size(-1) == self.hidden_dim
+        assert token_embeddings.size(-1) == self.hidden_dim
+        assert hidden_states.size(1) == token_embeddings.size(1), \
+            f"Sequence length mismatch: {hidden_states.size(1)} vs {token_embeddings.size(1)}"
+
+        hidden_states = self.input_norm(hidden_states)
         combined = torch.cat([hidden_states, token_embeddings], dim=-1)
-        combined = self.proj(combined)
-        logits = self.lm_head(hidden_states)
-        return logits, hidden_states
+        combined = self.input_proj(combined)
+        if self.dropout_val > 0.0:
+            combined = self.dropout(combined)
+
+        # Process through transformer layer
+        hidden_out = self.transformer(combined)
+
+        # Predict logits
+        logits = self.lm_head(hidden_out)
+
+        return logits, hidden_out
 
 class MultiTokenPrediction(torch.nn.Module):
-    def __init__(self, config, shared_embeddings: torch.nn.Embedding):
+    """
+    Multi-Token Prediction module.
+    
+    Creates multiple MTP blocks, each predicting tokens at increasing offsets.
+    - Depth 0: Main model predicts position +1 (standard LM)
+    - Depth 1: MTP block predicts position +2
+    - Depth d: MTP block predicts position +d+1
+    """
+    def __init__(self, config, shared_embeddings: torch.nn.Embedding, shared_lm_head: Optional[torch.nn.Linear] = None):
         super().__init__()
         self.mtp_depth = config.mtp_depth
+        self.hidden_dim = config.hidden_dim
+
+        assert self.mtp_depth > 0, f"mtp_depth must be > 0, got {self.mtp_depth}"
+
         self.embeddings = shared_embeddings
 
-        # One block per mtp_depth
+        # One block per MTP depth
         self.mtp_blocks = torch.nn.ModuleList([
-            MTPBlock(config) for _ in range(self.mtp_depth)
+            MTPBlock(config, shared_lm_head=shared_lm_head)
+            for _ in range(self.mtp_depth)
         ])
 
     def forward(
@@ -57,7 +184,6 @@ class MultiTokenPrediction(torch.nn.Module):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> List[torch.Tensor]:
-
         """
         Args:
             hidden_states: The hidden states from the transformer block (batch_size, seq_len, hidden_dim)
@@ -66,23 +192,36 @@ class MultiTokenPrediction(torch.nn.Module):
         Returns:
             all_logits: List of logits tensors, one per MTP depth
         """
-        all_logits = []
+        B, S, H = hidden_states.shape
 
-        for depth in range(self.mtp_depth):
+        assert hidden_states.size(0) == input_ids.size(0), \
+            f"Batch size mismatch: hidden_states {hidden_states.size(0)} vs input_ids {input_ids.size(0)}"
+
+        assert input_ids.size(0) == B
+        assert input_ids.size(1) == S
+
+        all_logits = []
+        current_hidden = hidden_states
+
+        for depth, mtp_block in enumerate(self.mtp_blocks):
             offset = depth + 1
             
-            # Get token embeddings of tokens at offset position
-            shifted_ids = input_ids[:, offset:]
+            # Need at least offset+1 positions to make a prediction
+            if S <= offset:
+                break
+            
+            # Get shifted token embeddings (tokens at positions offset onwards)
+            shifted_ids = input_ids[:, offset:]  # (B, seq_len - offset)
             token_emb = self.embeddings(shifted_ids)
-
-            # Truncate hidden states to match offset
-            hidden_trunc = hidden_states[:, :token_emb.shape[1]]
-
+            
+            # Truncate hidden states to match
+            valid_len = token_emb.size(1)
+            hidden_trunc = current_hidden[:, :valid_len]
+            
             # Forward through MTP block
-            logits, hidden_states_new = self.mtp_blocks[depth](hidden_trunc, token_emb)
-
+            logits, current_hidden = mtp_block(hidden_trunc, token_emb)
+            
             all_logits.append(logits)
-            hidden_states = hidden_states_new
         
         return all_logits
 
@@ -93,7 +232,6 @@ def compute_mtp_loss(
     mtp_lambda: float = 0.3,
     ignore_idx: int = -100,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-
     """
     Compute combined loss for main LM head output + MTP predictions
 
@@ -108,40 +246,47 @@ def compute_mtp_loss(
         total_loss: Combined weighted loss
         loss_dict: Dictionary of individual losses for logging
     """
+    vocab_size = main_logits.size(-1)
+    batch_size, seq_len = input_ids.shape
+
     loss_dict = {}
-    vocab_size = main_logits.shape[-1]
 
     # Depth 0
     # predict token at position i+1 from position i
-    logits_d0 = main_logits[:, :-1].contiguous()
-    targets_d0 = input_ids[:, 1:].contiguous()
-
-    loss_d0 = torch.nn.functional.cross_entropy(
-        logits_d0.view(-1, vocab_size),
-        targets_d0.view(-1),
+    loss_main = torch.nn.functional.cross_entropy(
+        main_logits.reshape(-1, vocab_size),
+        input_ids.reshape(-1),
         ignore_index=ignore_idx,
     )
-    loss_dict["loss_d0"] = loss_d0
-    total_loss = loss_d0
+    loss_dict["loss_depth_0"] = loss_main
+    total_loss = loss_main
 
     # MTP depths: 1, 2, ..., mtp_depth-1
-    for depth, logits in enumerate(mtp_logits):
-        target_offset = depth + 2
-        targets = input_ids[:, target_offset:].contiguous()
+    for depth, logits_d in enumerate(mtp_logits):
+        target_offset = depth + 1
+
+        if seq_len <= target_offset:
+            break
+
+        targets = input_ids[:, target_offset:]
 
         # Truncate logits to match targets length
         # (Last few positions don't have targets)
-        valid_len = targets.shape[1]
-        logits = logits[:, :valid_len].contiguous()
+        valid_len = min(logits_d.size(1), targets.size(1))
+        if valid_len <= 0:
+            break
 
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, vocab_size),
-            targets.view(-1),
+        logits_truncated = logits_d[:, :valid_len].contiguous()
+        targets_truncated = targets[:, :valid_len].contiguous()
+
+        loss_d = torch.nn.functional.cross_entropy(
+            logits_truncated.view(-1, vocab_size),
+            targets_truncated.view(-1),
             ignore_index=ignore_idx,
         )
 
-        loss_dict[f"mtp_loss_depth_{depth + 1}"] = loss
-        total_loss = total_loss + (mtp_lambda * loss)
+        loss_dict[f"loss_depth_{depth + 1}"] = loss_d
+        total_loss = total_loss + (mtp_lambda * loss_d)
 
     loss_dict["total_loss"] = total_loss
     return total_loss, loss_dict
@@ -213,4 +358,4 @@ if __name__ == "__main__":
         valid_len = targets.shape[1]
         print(f"  mtp_logits[{i}][:, :{valid_len}]: {logits[:, :valid_len].shape} -> targets {targets.shape}")
     
-    print("\nMTP test passed! ✓")
+    print("\nMTP test passed!")

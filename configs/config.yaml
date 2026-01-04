@@ -10,7 +10,7 @@ data:
   train_split: "sample-10BT"
   tokenizer: "deepseek-ai/DeepSeek-v3"
   max_seq_len: 2048
-  max_tokens: 5_000_000_000
+  max_tokens: 1_000_000_000
   num_workers: 4
 
 # ============= Training =========================
@@ -61,12 +61,13 @@ logging:
 
   # W&B logging (optional setup)
   use_wandb: false
-  wandb_project: "deepseek-v3-nano"
+  wandb_project: null
   wandb_entity: null
 
   # MLflow
   use_mlflow: true
-  mlflow_experiment: "deepseek-v3-nano"
+  databricks_workspace_id: "/Users/nilesh.auradkar14@gmail.com/"
+  mlflow_experiment: "deepseek-v3"
   mlflow_tracking_uri: "databricks"
   mlflow_registry_uri: "databricks-uc"
   mlflow_run_name: "deepseek-v3-nano-base-v1"
@@ -76,7 +77,7 @@ logging:
 # ============ Hardware =========================
 hardware:
   num_gpus: 1
-  num_workers: 4
+  num_workers: 0
   pin_memory: true
 
   # Distributed settings (for multi-GPU)

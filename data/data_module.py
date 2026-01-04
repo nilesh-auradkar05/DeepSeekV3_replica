@@ -1,306 +1,274 @@
 """
-DeepSeek-V3 Nano: Data Module
-=============================
+DeepSeek-V3 Data Module
+=======================
 
 Handles data loading and preprocessing for language model training.
+
+Key features:
+    - Streaming dataset from HuggingFace (memory efficient)
+    - On-the-fly tokenization
+    - Proper token buffer management (no gaps between sequences)
+    - Configurable token budget for training runs
+
+For validation, we sample real data from the dataset rather than
+random tokens, ensuring meaningful validation metrics.
 """
-from datasets import IterableDataset
+
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 import lightning as L
-from typing import Optional, List
+from typing import Optional, Iterator, List
 
-class TextDataset(Dataset):
-    """
-    Dataset for Language Model Training.
-
-    Handles tokenization and chunking of text data.
-    """
-
-    def __init__(
-        self,
-        data: List[str],
-        tokenizer,
-        max_seq_len: int = 2048,
-    ):
-
-        self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
-
-        # Tokenize all texts and concatenate
-        all_tokens = []
-        for text in data:
-            tokens = tokenizer.encode(text, add_special_tokens=False)
-            all_tokens.extend(tokens)
-
-        # Chunk into sequences of max_seq_len
-        self.chunks = []
-        for i in range(0, len(all_tokens), max_seq_len):
-            chunk = all_tokens[i:i+max_seq_len+1] # +1 for the Next token prediction
-            if len(chunk) == max_seq_len + 1:
-                self.chunks.append(chunk)
-
-    def __len__(self):
-        return len(self.chunks)
-
-    def __getitem__(self, idx):
-        chunk = self.chunks[idx]
-        input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
-        labels = torch.tensor(chunk[1:], dtype=torch.long)
-        return {"input_ids": input_ids, "labels": labels}
-
-class DeepSeekDataModule(L.LightningDataModule):
-    """PyTorch Lightning DataModule for DeepSeek-V3 training."""
-
-    def __init__(
-        self,
-        dataset_name: str = "openwebtext",
-        train_split: str = "train",
-        val_split: str = "validation",
-        tokenizer_name: str = "gpt4",
-        max_seq_len: int = 2048,
-        batch_size: int = 32,
-        num_workers: int = 4,
-        pin_memory: bool = True,
-    ):
-        super().__init__()
-        self.dataset_name = dataset_name
-        self.train_split = train_split
-        self.val_split = val_split
-        self.tokenizer_name = tokenizer_name
-        self.max_seq_len = max_seq_len
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
-
-        self.tokenizer = None
-        self.train_dataset = None
-        self.val_dataset = None
-
-    def prepare_data(self):
-        """Download and prepare the dataset."""
-        from datasets import load_dataset
-        from transformers import AutoTokenizer
-
-        # Download dataset
-        load_dataset(self.dataset_name, split=self.train_split, trust_remote_code=True)
-
-        # Download tokenizer
-        AutoTokenizer.from_pretrained(self.tokenizer_name)
-
-    def setup(self, stage: Optional[str] = None):
-        """Setup datasets (called on every GPU)"""
-        from datasets import load_dataset
-        from transformers import AutoTokenizer
-
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
-
-        # Ensure pad token exists
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # Load datasets
-        if stage == "fit" or stage is None:
-            train_data = load_dataset(
-                self.dataset_name,
-                split=self.train_split,
-                trust_remote_code=True,
-            )
-
-            train_texts: list[str] | None = None
-            # Extract text field (handle different dataset formats)
-            if "text" in train_data.column_names:
-                train_texts = train_data["text"]
-            elif "content" in train_data.column_names:
-                train_texts = train_data["content"]
-            else:
-                # Assume first column is text
-                for col in train_data.column_names:
-                    if isinstance(train_data[0][col], str):
-                        train_texts = train_data[col]
-                        break
-
-            if train_texts is None:
-                raise ValueError(
-                    f"No text field found in dataset {self.dataset_name}"
-                )
-
-            self.train_dataset = TextDataset(
-                train_texts,
-                self.tokenizer,
-                self.max_seq_len,
-            )
-
-            val_texts: list[str] | None = None
-
-            # Validation set
-            try:
-                val_data = load_dataset(
-                    self.dataset_name,
-                    split=self.val_split,
-                    trust_remote_code=True,
-                )
-                if "text" in val_data.column_names:
-                    val_texts = val_data["text"]
-                elif "content" in val_data.column_names:
-                    val_texts = val_data["content"]
-                else:
-                    for col in val_data.column_names:
-                        if isinstance(val_data[0][col], str):
-                            val_texts = val_data[col]
-                            break
-
-                if val_texts is None:
-                    raise ValueError(
-                        f"No text field found in dataset {self.dataset_name}"
-                    )
-
-                self.val_dataset = TextDataset(
-                    val_texts,
-                    self.tokenizer,
-                    self.max_seq_len,
-                )
-
-            except Exception:
-                # If no validation split, use part of training
-                print("No validation split found. Using 5% of training data as validation data.")
-                n_val = max(100, len(self.train_dataset) // 20)
-                self.val_dataset = torch.utils.data.Subset(
-                    self.train_dataset,
-                    range(n_val),
-                )
-
-    def train_dataloader(self):
-        if self.train_dataset is None:
-            raise ValueError("train_dataset is not set.")
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=True,
-        )
-
-    def val_dataloader(self):
-        if self.val_dataset is None:
-            raise ValueError("val_dataset is not set.")
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=False,
-        )
-
-    @property
-    def vocab_size(self) -> int:
-        """Get vocabulary size from tokenizer"""
-        if self.tokenizer is None:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
-            return tokenizer.vocab_size
-        return self.tokenizer.vocab_size
 
 class StreamingTextDataset(IterableDataset):
     """
-    Streaming dataset for pre-training.
-    Streams from HuggingFace, tokenizes on-the-fly, and stops at max_tokens.
+    Streaming dataset for large-scale pretraining.
+    
+    Streams from HuggingFace datasets, tokenizes on-the-fly, and yields
+    fixed-length sequences. Stops after max_tokens to control training budget.
+    
+    Important: Use num_workers=0 with this dataset to avoid sampler conflicts.
     """
+    
     def __init__(
         self,
         dataset_name: str = "HuggingFaceFW/fineweb-edu",
         subset: str = "sample-10BT",
         split: str = "train",
-        tokenizer_name: str = "gpt4",
+        tokenizer_name: str = "deepseek-ai/DeepSeek-V3",
         max_seq_len: int = 2048,
-        max_tokens: int = 5_000_000_000,
+        max_tokens: int = 1_000_000_000,
         seed: int = 47,
     ):
-
+        super().__init__()
         self.dataset_name = dataset_name
         self.subset = subset
-        self.data_split = split
+        self.split = split
         self.tokenizer_name = tokenizer_name
         self.max_seq_len = max_seq_len
         self.max_tokens = max_tokens
         self.seed = seed
+        
+        # Lazy-loaded tokenizer
         self._tokenizer = None
-
+    
     @property
     def tokenizer(self):
+        """Lazy load tokenizer on first access."""
         if self._tokenizer is None:
             from transformers import AutoTokenizer
             self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
         return self._tokenizer
-
-    def __iter__(self):
+    
+    @property
+    def vocab_size(self) -> int:
+        """Get vocabulary size from tokenizer."""
+        return len(self.tokenizer)
+    
+    def __iter__(self) -> Iterator[dict]:
+        """
+        Iterate through dataset, yielding tokenized sequences.
+        
+        Handles multi-worker sharding if workers are used.
+        """
         from datasets import load_dataset
-
-        dataset = load_dataset( # type: ignore[call-overload]
+        
+        # Handle multi-worker data loading
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+        
+        # Load streaming dataset
+        dataset = load_dataset(
             self.dataset_name,
-            subset=self.subset,
-            split=self.data_split,
+            name=self.subset,
+            split=self.split,
             streaming=True,
             trust_remote_code=True,
         )
-        dataset = dataset.shuffle(seed=self.seed, buffer_size=50_000)
-
-        token_buffer = []
+        
+        # Shuffle with worker-specific seed for different data per worker
+        dataset = dataset.shuffle(seed=self.seed + worker_id, buffer_size=10_000)
+        
+        # Token buffer for accumulating partial sequences
+        token_buffer: List[int] = []
         tokens_yielded = 0
-
-        for sample in dataset:
-            text = sample.get("text", "")
-            if not text:
+        tokens_per_worker = self.max_tokens // num_workers
+        
+        for sample_idx, sample in enumerate(dataset):
+            # Shard samples across workers
+            if sample_idx % num_workers != worker_id:
                 continue
-
+            
+            text = sample.get("text", "")
+            if not text or not text.strip():
+                continue
+            
+            # Tokenize
             tokens = self.tokenizer.encode(text, add_special_tokens=False)
             token_buffer.extend(tokens)
-
-            # Yield chunks
+            
+            # Yield complete sequences
+            # Each sequence needs max_seq_len + 1 tokens (input + target)
             while len(token_buffer) >= self.max_seq_len + 1:
+                # Extract sequence
                 chunk = token_buffer[:self.max_seq_len + 1]
-                token_buffer = token_buffer[self.max_seq_len:]
-
+                
+                # IMPORTANT: Remove exactly the tokens we used
+                # This ensures no gaps between consecutive sequences
+                token_buffer = token_buffer[self.max_seq_len + 1:]
+                
                 yield {
                     "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
                     "labels": torch.tensor(chunk[1:], dtype=torch.long),
                 }
-
+                
                 tokens_yielded += self.max_seq_len
-
-                # Stop at token limit
-                if tokens_yielded >= self.max_tokens:
+                
+                # Check token budget
+                if tokens_yielded >= tokens_per_worker:
                     return
 
 
-class FineWebDataModule(L.LightningDataModule):
+class ValidationDataset(Dataset):
     """
-    Lightning DataModule for FineWeb-Edu pre-training.
-
-    Available subsets:
-        - sample-10BT: ~10B Tokens (~40GB)
-        - sample-100BT: ~100B Tokens (~400GB)
-        - sample-350BT: ~350B Tokens (~1.4TB)
+    Fixed validation dataset with real data samples.
+    
+    Loads a fixed set of samples at initialization for consistent
+    validation metrics across training.
     """
+    
     def __init__(
         self,
         dataset_name: str = "HuggingFaceFW/fineweb-edu",
         subset: str = "sample-10BT",
-        tokenizer_name: str = "gpt4",
+        tokenizer_name: str = "deepseek-ai/DeepSeek-V3",
         max_seq_len: int = 2048,
-        max_tokens: int = 5_000_000_000,
-        batch_size: int = 32,
-        num_workers: int = 4,
+        num_samples: int = 500,
         seed: int = 47,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.max_seq_len = max_seq_len
+        self.num_samples = num_samples
+        
+        # Load tokenizer
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Load and prepare samples
+        self.samples = self._prepare_samples(
+            dataset_name, subset, tokenizer, seed
+        )
+    
+    def _prepare_samples(
+        self,
+        dataset_name: str,
+        subset: str,
+        tokenizer,
+        seed: int,
+    ) -> List[dict]:
+        """Load and tokenize validation samples."""
+        from datasets import load_dataset
+        
+        samples = []
+        token_buffer = []
+        
+        # Load streaming dataset with fixed seed for reproducibility
+        dataset = load_dataset(
+            dataset_name,
+            name=subset,
+            split="train",  # Use train split, just different samples
+            streaming=True,
+            trust_remote_code=True,
+        )
+        dataset = dataset.shuffle(seed=seed + 1000, buffer_size=1000)
+        
+        for sample in dataset:
+            text = sample.get("text", "")
+            if not text or not text.strip():
+                continue
+            
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            token_buffer.extend(tokens)
+            
+            while len(token_buffer) >= self.max_seq_len + 1 and len(samples) < self.num_samples:
+                chunk = token_buffer[:self.max_seq_len + 1]
+                token_buffer = token_buffer[self.max_seq_len + 1:]
+                
+                samples.append({
+                    "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
+                    "labels": torch.tensor(chunk[1:], dtype=torch.long),
+                })
+            
+            if len(samples) >= self.num_samples:
+                break
+        
+        return samples
+    
+    def __len__(self) -> int:
+        return len(self.samples)
+    
+    def __getitem__(self, idx: int) -> dict:
+        return self.samples[idx]
 
+
+class DummyDataset(Dataset):
+    """
+    Random token dataset for testing without real data.
+    
+    Useful for debugging model architecture and training loop.
+    """
+    
+    def __init__(self, vocab_size: int, max_seq_len: int, num_samples: int):
+        assert vocab_size > 0, "vocab_size must be positive"
+        assert max_seq_len > 0, "max_seq_len must be positive"
+        assert num_samples > 0, "num_samples must be positive"
+        
+        self.vocab_size = vocab_size
+        self.max_seq_len = max_seq_len
+        self.num_samples = num_samples
+    
+    def __len__(self) -> int:
+        return self.num_samples
+    
+    def __getitem__(self, idx: int) -> dict:
+        # Use idx as seed for reproducible "random" data
+        g = torch.Generator().manual_seed(idx)
+        tokens = torch.randint(0, self.vocab_size, (self.max_seq_len + 1,), generator=g)
+        return {
+            "input_ids": tokens[:-1],
+            "labels": tokens[1:],
+        }
+
+
+class FineWebDataModule(L.LightningDataModule):
+    """
+    PyTorch Lightning DataModule for DeepSeek-V3 training.
+    
+    Combines streaming training data with fixed validation data.
+    """
+    
+    def __init__(
+        self,
+        dataset_name: str = "HuggingFaceFW/fineweb-edu",
+        subset: str = "sample-10BT",
+        tokenizer_name: str = "deepseek-ai/DeepSeek-V3",
+        max_seq_len: int = 2048,
+        max_tokens: int = 1_000_000_000,
+        batch_size: int = 16,
+        num_workers: int = 0,  # Must be 0 for streaming
+        pin_memory: bool = True,
+        seed: int = 47,
+        val_samples: int = 500,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        # Store parameters
         self.dataset_name = dataset_name
         self.subset = subset
         self.tokenizer_name = tokenizer_name
@@ -308,10 +276,28 @@ class FineWebDataModule(L.LightningDataModule):
         self.max_tokens = max_tokens
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.pin_memory = pin_memory
         self.seed = seed
-
-    def setup(self, stage: Optional[str] = None):
+        self.val_samples = val_samples
+        
+        # Will be populated in setup()
+        self.train_dataset = None
+        self.val_dataset = None
+        self._vocab_size = None
+    
+    @property
+    def vocab_size(self) -> int:
+        """Get vocabulary size from tokenizer."""
+        if self._vocab_size is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+            self._vocab_size = len(tokenizer)
+        return self._vocab_size
+    
+    def setup(self, stage: Optional[str] = None) -> None:
+        """Set up datasets for training and validation."""
         if stage == "fit" or stage is None:
+            # Training dataset (streaming)
             self.train_dataset = StreamingTextDataset(
                 dataset_name=self.dataset_name,
                 subset=self.subset,
@@ -320,29 +306,51 @@ class FineWebDataModule(L.LightningDataModule):
                 max_tokens=self.max_tokens,
                 seed=self.seed,
             )
-
-            self.val_dataset = DummyDataset(100_000, self.max_seq_len, 5000)
-
-    def train_dataloader(self):
-        from typing import cast
+            
+            # Validation dataset (fixed samples for consistent metrics)
+            self.val_dataset = ValidationDataset(
+                dataset_name=self.dataset_name,
+                subset=self.subset,
+                tokenizer_name=self.tokenizer_name,
+                max_seq_len=self.max_seq_len,
+                num_samples=self.val_samples,
+                seed=self.seed,
+            )
+    
+    def train_dataloader(self) -> DataLoader:
+        """Create training dataloader."""
+        if self.train_dataset is None:
+            raise RuntimeError("Call setup() before train_dataloader()")
         
         return DataLoader(
-            cast(Dataset, self.train_dataset),
+            self.train_dataset,
             batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=True,
+            shuffle=False,  # Streaming handles shuffling
+            num_workers=0,  # Required for IterableDataset
+            pin_memory=self.pin_memory,
+            drop_last=True,
         )
-
-    def val_dataloader(self):
+    
+    def val_dataloader(self) -> DataLoader:
+        """Create validation dataloader."""
+        if self.val_dataset is None:
+            raise RuntimeError("Call setup() before val_dataloader()")
+        
         return DataLoader(
             self.val_dataset,
-            batch_size=self.batch_size
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
         )
+
 
 class DummyDataModule(L.LightningDataModule):
     """
     Dummy data module for testing without real data.
-    Generates random token sequences.
+    
+    Generates random token sequences for architecture debugging.
     """
     
     def __init__(
@@ -352,7 +360,7 @@ class DummyDataModule(L.LightningDataModule):
         batch_size: int = 32,
         train_samples: int = 10000,
         val_samples: int = 1000,
-        num_workers: int = 2,
+        num_workers: int = 0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -361,8 +369,12 @@ class DummyDataModule(L.LightningDataModule):
         self.train_samples = train_samples
         self.val_samples = val_samples
         self.num_workers = num_workers
+        
+        self.train_dataset = None
+        self.val_dataset = None
     
-    def setup(self, stage: Optional[str] = None):
+    def setup(self, stage: Optional[str] = None) -> None:
+        """Set up dummy datasets."""
         self.train_dataset = DummyDataset(
             self.vocab_size,
             self.max_seq_len,
@@ -374,7 +386,9 @@ class DummyDataModule(L.LightningDataModule):
             self.val_samples,
         )
     
-    def train_dataloader(self):
+    def train_dataloader(self) -> DataLoader:
+        if self.train_dataset is None:
+            raise RuntimeError("Call setup() before train_dataloader()")
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -382,59 +396,12 @@ class DummyDataModule(L.LightningDataModule):
             num_workers=self.num_workers,
         )
     
-    def val_dataloader(self):
+    def val_dataloader(self) -> DataLoader:
+        if self.val_dataset is None:
+            raise RuntimeError("Call setup() before val_dataloader()")
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
         )
-
-
-class DummyDataset(Dataset):
-    """Random token dataset for testing."""
-    
-    def __init__(self, vocab_size: int, max_seq_len: int, num_samples: int):
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
-        self.num_samples = num_samples
-    
-    def __len__(self):
-        return self.num_samples
-    
-    def __getitem__(self, idx):
-        # Generate random tokens
-        g = torch.Generator().manual_seed(idx)
-        tokens = torch.randint(0, self.vocab_size, (self.max_seq_len + 1,), generator=g)
-        return {
-            "input_ids": tokens[:-1],
-            "labels": tokens[1:]
-        }
-
-
-# ============== Test ==============
-if __name__ == "__main__":
-
-    print("Testing Data Modules")
-
-    
-    # Test dummy data module
-    print("\nTesting DummyDataModule...")
-    dm = DummyDataModule(
-        vocab_size=32000,
-        max_seq_len=256,
-        batch_size=4,
-        train_samples=100,
-        val_samples=20,
-    )
-    dm.setup()
-    
-    train_loader = dm.train_dataloader()
-    batch = next(iter(train_loader))
-    
-    print(f"  Batch input_ids shape: {batch['input_ids'].shape}")
-    print(f"  Batch labels shape: {batch['labels'].shape}")
-    print(f"  Train batches: {len(train_loader)}")
-    print(f"  Val batches: {len(dm.val_dataloader())}")
-    
-    print("\nDummy data module test passed!")        

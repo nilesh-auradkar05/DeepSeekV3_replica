@@ -32,3 +32,8 @@ name = "pytorch_cuda"
 url = "https://download.pytorch.org/whl/cu130"
 priority = "explicit"
 
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.2,<10.0.0)"
+]
